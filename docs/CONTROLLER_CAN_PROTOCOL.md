@@ -2,18 +2,18 @@
 
 ## Mục lục
 
-1. Tổng quan dự án
-2. Các chức năng firmware đã implement
-3. Cấu hình chính trong `config.h`
-4. CAN protocol cho Controller
-5. Luồng hoạt động cho Controller
-6. Test cases đã thực hiện và kết quả
-7. Kết quả đạt được
-8. Hướng dẫn cho Controller code theo
-9. Lưu ý quan trọng
-10. Phần còn lại và đề xuất phát triển tiếp
-11. Điểm khác biệt so với document/spec ban đầu
-12. Kết luận
+1. [Tổng quan dự án](#1-tổng-quan-dự-án)
+2. [Các chức năng firmware đã implement](#2-các-chức-năng-firmware-đã-implement)
+3. [Cấu hình chính trong `config.h`](#3-cấu-hình-chính-trong-configh)
+4. [CAN protocol cho Controller](#4-can-protocol-cho-controller)
+5. [Luồng hoạt động cho Controller](#5-luồng-hoạt-động-cho-controller)
+6. [Test cases đã thực hiện và kết quả](#6-test-cases-đã-thực-hiện-và-kết-quả)
+7. [Kết quả đạt được](#7-kết-quả-đạt-được)
+8. [Phần còn lại và đề xuất phát triển tiếp](#8-phần-còn-lại-và-đề-xuất-phát-triển-tiếp)
+9. [Điểm khác biệt so với document/spec ban đầu](#9-điểm-khác-biệt-so-với-documentspec-ban-đầu)
+10. [Kết luận](#10-kết-luận)
+
+---
 
 ## 1. Tổng quan dự án
 
@@ -22,7 +22,7 @@ Project `DC_Combiner_MCU_IO_FW` là firmware cho MCU I/O board dùng trong DC Co
 Mỗi group contactor có 1 output điều khiển chung và 2 feedback input:
 
 ```text
-Group x output  -> OUT_x
+Group x output   -> OUT_x
 Group x feedback -> FBx_P và FBx_N
 ```
 
@@ -36,7 +36,8 @@ Vai trò của MCU I/O board:
 - Phát hiện lỗi timeout, mismatch, stuck contact, unexpected OFF.
 - Gửi status frame `0x510 + NodeID`.
 - Gửi heartbeat/diagnostic frame `0x520 + NodeID`.
-- Fail-safe khi fault hoặc Lost CAN: output phải OFF.
+- Khi group fault: output của group bị fault được đưa về OFF.
+- Khi Lost CAN fail-safe: toàn bộ output được đưa về OFF.
 
 MCU/CubeMX hiện tại:
 
@@ -49,6 +50,8 @@ MCU/CubeMX hiện tại:
 | CAN bitrate | 500 kbps |
 | CAN mode | Normal |
 | CAN timing | Prescaler 4, BS1 13TQ, BS2 4TQ, SJW 1TQ |
+
+---
 
 ## 2. Các chức năng firmware đã implement
 
@@ -68,7 +71,7 @@ Chức năng đã có:
 - Đọc DIP switch NodeID.
 - Quản lý output command mask.
 - Có `BSP_GPIO_AllOutputsOff()` để tắt toàn bộ output.
-- Không tự định nghĩa chân bằng số riêng, dùng macro CubeMX trong `main.h`.
+- Dùng macro CubeMX trong `main.h`, không tự định nghĩa chân bằng số riêng.
 
 Output logic hiện tại:
 
@@ -112,16 +115,15 @@ Feedback logic hiện tại:
 #define CONFIG_FEEDBACK_ACTIVE_LOW (1U)
 ```
 
-Nghĩa là firmware đang hiểu input active low:
+Feedback active low đã được xác nhận qua board test:
 
-- Pin đọc LOW -> feedback ON.
-- Pin đọc HIGH -> feedback OFF.
-
-Ghi chú: `config.h` vẫn có comment rằng feedback polarity cần xác nhận trên board thật. Báo cáo này mô tả theo firmware hiện tại.
+- Pin feedback kéo xuống LOW/PGND/GND -> firmware đọc feedback ON.
+- Pin feedback ở mức HIGH/open theo pull-up -> firmware đọc feedback OFF.
+- Không cấp trực tiếp +24V vào chân feedback.
 
 #### Mapping raw feedback bit
 
-`BSP_GPIO_ReadFeedbackMask()` trả mask 12 bit, theo thứ tự:
+`BSP_GPIO_ReadFeedbackMask()` trả mask 12 bit theo thứ tự:
 
 | Bit | Ý nghĩa |
 | --- | --- |
@@ -152,7 +154,9 @@ DIP logic hiện tại:
 #define CONFIG_DIP_ACTIVE_LOW (1U)
 ```
 
-Firmware đọc NodeID bằng cách đảo logic theo active low và mask với `CONFIG_CAN_NODE_ID_MAX = 7`.
+Firmware đọc NodeID bằng cách đảo logic theo active low và mask với `CONFIG_CAN_NODE_ID_MAX = 7`. NodeID được dùng để tính CAN ID command/status/heartbeat.
+
+---
 
 ### 2.2 Feedback debounce
 
@@ -170,7 +174,7 @@ Chức năng:
 - Từ raw mask, firmware derive trạng thái từng group.
 - Có debounce theo `CONFIG_FEEDBACK_DEBOUNCE_MS`.
 - API cho contactor dùng trả về trạng thái stable/debounced.
-- `Feedback_GetRawMask()` vẫn trả raw mask tức thời để phục vụ status/diagnostic.
+- `Feedback_GetRawMask()` trả raw mask tức thời để phục vụ status/diagnostic.
 
 Phân loại feedback từng group:
 
@@ -192,6 +196,8 @@ Vì sao cần debounce:
 - Feedback contactor có thể rung/glitch khi tiếp điểm chuyển trạng thái.
 - Contactor state machine không nên xử lý ngay một mẫu nhiễu ngắn.
 - Debounce nằm trong `feedback.c`, nên `contactor.c` dùng tín hiệu đã stable.
+
+---
 
 ### 2.3 Contactor state machine
 
@@ -233,6 +239,8 @@ Rule an toàn:
 - `Contactor_ClearFault()` chỉ clear fault nếu feedback stable đang OFF.
 - Nếu feedback vẫn ON hoặc MISMATCH khi clear fault, group vẫn FAULT và cập nhật fault tương ứng.
 
+---
+
 ### 2.4 CAN communication
 
 Module:
@@ -263,11 +271,13 @@ CAN RX command chỉ được xem là hợp lệ khi:
 - `DLC >= CONFIG_CAN_COMMAND_DLC`.
 - `HAL_CAN_GetRxMessage()` trả OK.
 
-Lưu ý quan trọng:
+Lưu ý:
 
-- `CONFIG_CAN_COMMAND_DLC` hiện là `1U`, nên firmware chấp nhận frame command có DLC tối thiểu 1.
+- `CONFIG_CAN_COMMAND_DLC` hiện là `1U`, nên firmware chấp nhận command frame có DLC tối thiểu 1.
 - Nếu frame có `DLC > CONFIG_CAN_COMMAND_FLAGS_INDEX`, firmware đọc thêm `Data[1]` làm control flags.
 - Bên Controller nên gửi DLC 8 để thống nhất format và reserved bytes.
+
+---
 
 ### 2.5 Diagnostic / Heartbeat
 
@@ -295,6 +305,8 @@ Trách nhiệm module sau refactor:
 
 Heartbeat không refresh Lost CAN timeout. Lost CAN chỉ refresh khi MCU nhận command frame hợp lệ từ Controller.
 
+---
+
 ### 2.6 Fault manager hiện tại
 
 Module:
@@ -311,10 +323,12 @@ Hiện trạng:
 - Lost CAN fail-safe và global status hiện do `can_comm.c` quản lý.
 - Chưa refactor fault manager lớn để tránh ảnh hưởng behavior đã test.
 
-Khuyến nghị hiện tại:
+Định hướng nếu mở rộng sau này:
 
-- Chưa nên chuyển state machine/fault handling ra khỏi `contactor.c`.
-- Nếu cần dùng `fault.c/h`, Phase 1 chỉ nên gom helper/status summary, không đổi behavior.
+- Có thể dùng `fault.c/h` làm helper/status summary.
+- Không nên chuyển state machine/fault handling ra khỏi `contactor.c` khi chưa có yêu cầu rõ ràng.
+
+---
 
 ### 2.7 App runtime
 
@@ -347,6 +361,8 @@ Ghi chú runtime:
 
 - `CanComm_Task()` gửi status/heartbeat trước khi `Contactor_Task()` xử lý state machine trong cùng một vòng `App_Task()`.
 - Vì vậy một fault vừa phát sinh từ feedback stable có thể được phản ánh ở status frame sau chu kỳ task tiếp theo.
+
+---
 
 ## 3. Cấu hình chính trong `config.h`
 
@@ -390,6 +406,8 @@ Global status bit:
 | bit1 | `CONFIG_STATUS_ANY_FAULT_MASK` | Có group fault hoặc fail-safe active |
 | bit2 | `CONFIG_STATUS_FAILSAFE_ACTIVE_MASK` | Fail-safe active, ví dụ Lost CAN |
 
+---
+
 ## 4. CAN protocol cho Controller
 
 ### 4.1 CAN ID
@@ -409,6 +427,8 @@ Ví dụ:
 | 0 | 0x500 | 0x510 | 0x520 |
 | 1 | 0x501 | 0x511 | 0x521 |
 | 7 | 0x507 | 0x517 | 0x527 |
+
+---
 
 ### 4.2 Command frame Controller gửi xuống MCU
 
@@ -471,7 +491,9 @@ Rule an toàn:
 
 - Clear Fault chỉ hợp lệ khi `Data[0] == 0x00`.
 - Không được gửi ON command kèm Clear Fault cùng frame.
-- Ví dụ `01 01 00 00 00 00 00 00` không được clear fault và không được bật output; firmware xử lý fail-safe bằng all-off.
+- Ví dụ `01 01 00 00 00 00 00 00` là command không hợp lệ theo rule hiện tại: firmware không clear fault, không bật output, và đưa output về OFF theo hướng fail-safe. Controller không được gửi ON và Clear Fault trong cùng một frame.
+
+---
 
 ### 4.3 Status frame MCU gửi lên Controller
 
@@ -493,9 +515,9 @@ Payload:
 | `Data[2]` | Feedback raw mask high byte |
 | `Data[3]` | Group fault mask |
 | `Data[4]` | Global status |
-| `Data[5]` | Reserved |
-| `Data[6]` | Reserved |
-| `Data[7]` | Reserved |
+| `Data[5]` | Reserved, hiện gửi 0 |
+| `Data[6]` | Reserved, hiện gửi 0 |
+| `Data[7]` | Reserved, hiện gửi 0 |
 
 `Data[0]` output mask:
 
@@ -563,6 +585,8 @@ Giá trị phổ biến:
 | 0x03 | CAN online + có fault |
 | 0x07 | CAN online + có fault + fail-safe active |
 
+---
+
 ### 4.4 Heartbeat / Diagnostic frame MCU gửi lên Controller
 
 Frame:
@@ -592,7 +616,7 @@ Giải thích:
 - `Data[7]` tăng mỗi lần heartbeat gửi thành công.
 - `Data[7]` là `uint8_t`, nên `FF -> 00` là bình thường.
 - `Data[5]` tăng khi MCU nhận command frame hợp lệ từ Controller.
-- `Data[6]` là low byte của `tx_error_count`.
+- `Data[6]` là low byte của `tx_error_count`. Giá trị này có thể khác nhau theo runtime; Controller không nên expect cố định một giá trị cụ thể, chỉ cần theo dõi nếu counter tăng liên tục.
 - `Data[4]` giống global status trong status frame.
 
 Ví dụ:
@@ -607,7 +631,7 @@ Ví dụ:
 - NodeID `0`.
 - Global status `0x01`: CAN online, không fault.
 - Valid command RX counter low byte = `0x00`.
-- TX fail/error counter low byte = `0x90`.
+- TX fail/error counter low byte = `0x90` tại thời điểm log.
 - Heartbeat sequence = `0xD0`.
 
 Ví dụ NodeID 1:
@@ -622,8 +646,10 @@ Ví dụ NodeID 1:
 - NodeID `1`.
 - Global status `0x01`.
 - Đã nhận command hợp lệ, counter low byte = `0x01`.
-- TX fail counter = `0x00`.
+- TX fail counter = `0x00` tại thời điểm log.
 - Sequence = `0x0C`.
+
+---
 
 ## 5. Luồng hoạt động cho Controller
 
@@ -640,6 +666,8 @@ Ví dụ status bình thường:
 ```text
 0x510 Data = 00 00 00 00 01 00 00 00
 ```
+
+---
 
 ### 5.2 Bật 1 group thành công
 
@@ -678,6 +706,15 @@ Khi output ON và feedback G6 đủ:
 0x511 Data = 20 00 0C 00 01 00 00 00
 ```
 
+Giải thích:
+
+- `Data[0] = 20`: OUT Group 6 ON.
+- `Data[2] = 0C`: FB6_P và FB6_N đều ON.
+- `Data[3] = 00`: không group fault.
+- `Data[4] = 01`: CAN online, không fault.
+
+---
+
 ### 5.3 Bật group nhưng không có feedback
 
 Ví dụ NodeID 0, bật Group 1 nhưng feedback không ON:
@@ -704,6 +741,8 @@ Giải thích:
 - `Data[3] = 01`: Fault Group 1.
 - `Data[4] = 03`: CAN online + có fault.
 
+---
+
 ### 5.4 Clear Fault
 
 Controller gửi:
@@ -723,6 +762,8 @@ Nếu feedback vẫn ON hoặc MISMATCH:
 - Firmware không báo sạch giả.
 - Group vẫn FAULT.
 - Output vẫn OFF.
+
+---
 
 ### 5.5 Lost CAN fail-safe
 
@@ -758,6 +799,8 @@ Giải thích:
 - `Data[3] = 20`: Fault Group 6.
 - `Data[4] = 07`: fail-safe vẫn active.
 
+---
+
 ### 5.6 Command định kỳ để không bị Lost CAN
 
 Nếu muốn giữ Group 1 ON:
@@ -767,7 +810,7 @@ Gửi định kỳ:
 0x500 Data = 01 00 00 00 00 00 00 00
 ```
 
-Chu kỳ gửi command phải nhỏ hơn `CONFIG_CAN_COMMAND_TIMEOUT_MS`. Với cấu hình hiện tại, timeout là 3000 ms; nên Controller có thể gửi lại command mỗi 500 ms hoặc 1000 ms.
+Chu kỳ gửi command phải nhỏ hơn `CONFIG_CAN_COMMAND_TIMEOUT_MS`. Với cấu hình hiện tại, timeout là 3000 ms; Controller nên gửi lại command mỗi 500 ms hoặc 1000 ms.
 
 Expected:
 
@@ -775,11 +818,13 @@ Expected:
 Status không chuyển sang Data[4] = 07.
 ```
 
+---
+
 ## 6. Test cases đã thực hiện và kết quả
 
-Các PC tests dưới đây đã được chạy lại trong workspace hiện tại bằng MSYS2 UCRT64 + GCC + CMake + Ninja.
+### 6.1 Tổng hợp PC/unit test
 
-### 6.1 Tổng hợp PC test
+Các PC tests đã được chạy bằng MSYS2 UCRT64 + GCC + CMake + Ninja.
 
 | Test harness | Mục tiêu | Kết quả |
 | --- | --- | --- |
@@ -804,7 +849,9 @@ Memory:
 | RAM | 1888 B | 20 KB | 9.22% |
 | FLASH | 15296 B | 64 KB | 23.34% |
 
-### 6.2 Bảng testcase đại diện
+---
+
+### 6.2 Bảng testcase PC/unit test đại diện
 
 | ID | Mục tiêu test | Thao tác | Expected result | Actual result | Kết quả |
 | --- | --- | --- | --- | --- | --- |
@@ -830,21 +877,29 @@ Memory:
 | APP-01 | Init order | `App_Init()` | Feedback init trước contactor init, sau đó CAN init | Pass trong `App_TEST` | PASS |
 | INT-01 | Integration ON | App + feedback + contactor | Request ON thành ON_CONFIRMED | Pass trong `Integration_TEST` | PASS |
 
-### 6.3 Board test CAN basic
+---
 
-Trong workspace hiện tại không thấy file log/ảnh USB-CAN riêng để trích dẫn chính thức. Theo trao đổi trước đó, board đã được test OK, nhưng báo cáo này chỉ xác nhận bằng source/test log có trong workspace.
+### 6.3 Board test bằng USB-CAN-B
 
-Các testcase board nên lưu log nếu cần hoàn thiện hồ sơ:
+Board test đã thực hiện bằng USB-CAN-B với CAN 500 kbps, Standard Data Frame. Các testcase dưới đây đã pass trong quá trình bring-up.
 
-| Test | Expected |
-| --- | --- |
-| Boot nhận status `0x510 + NodeID` | `Data[0]=00`, `Data[4]=01` nếu CAN online |
-| Gửi command đúng ID | Firmware apply command |
-| Gửi sai ID | Firmware ignore |
-| OFF all | Output mask về 0 |
-| ON từng group | Output mask đúng bit group |
-| NodeID 0 | Command 0x500, Status 0x510, Heartbeat 0x520 |
-| NodeID 1 | Command 0x501, Status 0x511, Heartbeat 0x521, Heartbeat `Data[3]=01` |
+| ID | Mục tiêu test | Thao tác | Expected result | Actual result representative | Kết quả |
+| --- | --- | --- | --- | --- | --- |
+| BD-01 | Boot NodeID 0 | Reset/power-up board NodeID 0 | Nhận status `0x510`, heartbeat `0x520` | `0x510 Data = 00 00 00 00 01 00 00 00` và heartbeat `0x520` xuất hiện định kỳ | PASS |
+| BD-02 | Heartbeat sequence NodeID 0 | Quan sát `0x520` | `Data[7]` tăng dần và wrap `FF -> 00` | Sequence tăng `D0, D1, ... FF, 00, 01...` | PASS |
+| BD-03 | Command counter | Gửi command hợp lệ `0x500` | Heartbeat `Data[5]` tăng | Sau command hợp lệ, heartbeat `Data[5]` tăng từ `00` lên `01` | PASS |
+| BD-04 | NodeID 1 | Set DIP NodeID 1, reset board | Command `0x501`, status `0x511`, heartbeat `0x521` | Nhận `0x511` và `0x521`; heartbeat `Data[3] = 01` | PASS |
+| BD-05 | G1 feedback mapping | ON G1 và kéo FB1_P/FB1_N | `0x510 Data = 01 03 00 00 01 00 00 00` | Feedback G1 đủ ra `Data[1] = 03` | PASS |
+| BD-06 | G2 feedback mapping | ON G2 và kéo FB2_P/FB2_N | `0x510 Data = 02 0C 00 00 01 00 00 00` | Feedback G2 đủ ra `Data[1] = 0C` | PASS |
+| BD-07 | G3 feedback mapping | ON G3 và kéo FB3_P/FB3_N | `0x510 Data = 04 30 00 00 01 00 00 00` | Feedback G3 đủ ra `Data[1] = 30` | PASS |
+| BD-08 | G4 feedback mapping | ON G4 và kéo FB4_P/FB4_N | `0x510 Data = 08 C0 00 00 01 00 00 00` | Feedback G4 đủ ra `Data[1] = C0` | PASS |
+| BD-09 | G5 feedback mapping | ON G5 và kéo FB5_P/FB5_N | `0x510 Data = 10 00 03 00 01 00 00 00` | Feedback G5 đủ ra `Data[2] = 03` | PASS |
+| BD-10 | G6 feedback mapping | ON G6 và kéo FB6_P/FB6_N | `0x511 Data = 20 00 0C 00 01 00 00 00` với NodeID 1 | Feedback G6 đủ ra `Data[2] = 0C`, không fault | PASS |
+| BD-11 | Lost CAN fail-safe | Gửi ON một lần rồi ngừng command quá timeout | Output OFF, global `Data[4] = 07` | Status chuyển về output `00`, global `07` | PASS |
+| BD-12 | Stuck feedback sau Lost CAN | Giữ feedback ON sau khi output bị all-off | `Data[3]` có group fault tương ứng | Với G6: `0x511 Data = 00 00 0C 20 07 00 00 00` | PASS |
+| BD-13 | Heartbeat global status khi fault/fail-safe | Quan sát heartbeat trong fault/fail-safe | Heartbeat `Data[4]` phản ánh global status | Heartbeat `Data[4]` hiển thị `01`, `03`, hoặc `07` theo trạng thái hệ thống | PASS |
+
+---
 
 ### 6.4 Feedback mapping expected trên status
 
@@ -858,6 +913,8 @@ Các ví dụ dưới đây giả định output đã ON và feedback logical ON
 | G4 | `08 C0 00 00 01 00 00 00` |
 | G5 | `10 00 03 00 01 00 00 00` |
 | G6 | `20 00 0C 00 01 00 00 00` |
+
+---
 
 ### 6.5 Fault test expected
 
@@ -874,7 +931,11 @@ Ví dụ G1:
 0x510 Data = 00 00 00 01 03 00 00 00
 ```
 
+---
+
 ### 6.6 Clear Fault expected
+
+Controller gửi:
 
 ```text
 0x500 Data = 00 01 00 00 00 00 00 00
@@ -892,6 +953,8 @@ Nếu feedback chưa safe:
 - `Data[4]` vẫn có any fault.
 - Output vẫn OFF.
 
+---
+
 ### 6.7 Lost CAN expected
 
 Gửi ON một lần, sau đó ngừng command quá `CONFIG_CAN_COMMAND_TIMEOUT_MS`:
@@ -906,6 +969,8 @@ Nếu feedback vẫn ON đủ lâu sau khi output OFF:
 ```text
 Expected Data[3] có group fault stuck contact
 ```
+
+---
 
 ### 6.8 Heartbeat/Diagnostic expected
 
@@ -925,6 +990,8 @@ Ví dụ:
 0x521 Data = 01 00 00 01 01 01 00 0C
 ```
 
+---
+
 ## 7. Kết quả đạt được
 
 Firmware hiện tại đã đạt được:
@@ -940,97 +1007,17 @@ Firmware hiện tại đã đạt được:
 - Có status frame `0x510 + NodeID`.
 - Có heartbeat/diagnostic frame `0x520 + NodeID`.
 - Có NodeID qua DIP switch.
+- Đã test NodeID 0/1.
+- Đã test feedback mapping G1..G6 trên board.
+- Đã test Lost CAN và stuck feedback behavior.
 - Có PC test cho feedback, contactor, app, integration, CAN, diagnostic.
 - Firmware Debug build OK trên CMake/Ninja.
 
-## 8. Hướng dẫn cho Controller code theo
+---
 
-Checklist cho Controller:
+## 8. Phần còn lại và đề xuất phát triển tiếp
 
-1. Xác định NodeID của MCU I/O board.
-2. Gửi command tới `0x500 + NodeID`.
-3. Dùng Standard Data Frame, khuyến nghị DLC 8.
-4. Không gửi ON một lần rồi dừng nếu muốn giữ contactor ON.
-5. Gửi command định kỳ với chu kỳ nhỏ hơn `CONFIG_CAN_COMMAND_TIMEOUT_MS`.
-6. Đọc status từ `0x510 + NodeID`.
-7. Đọc heartbeat từ `0x520 + NodeID`.
-8. Kiểm tra status `Data[4]` để biết trạng thái global.
-9. Kiểm tra status `Data[3]` để biết group nào fault.
-10. Kiểm tra status `Data[1]/Data[2]` để xác nhận feedback.
-11. Khi fault, gửi OFF all hoặc Clear Fault đúng rule.
-12. Không gửi ON command kèm Clear Fault trong cùng frame.
-
-Pseudo-code tham khảo:
-
-```c
-void controller_task(uint8_t node_id)
-{
-    uint8_t command_mask = desired_output_mask & 0x3F;
-
-    send_command_periodically(node_id, command_mask);
-
-    status_t status = read_status(node_id);
-
-    if ((status.global & FAILSAFE_ACTIVE) != 0U)
-    {
-        /* MCU đã vào fail-safe, không tiếp tục spam ON command. */
-        send_off_all(node_id);
-    }
-
-    if (status.group_fault_mask != 0U)
-    {
-        /* Xác định group fault, kiểm tra feedback, log lỗi. */
-        send_off_all(node_id);
-    }
-
-    if (need_clear_fault && feedback_is_safe_off(status))
-    {
-        /* Data[0] = 0x00, Data[1] = 0x01 */
-        send_clear_fault(node_id);
-    }
-}
-```
-
-Frame helper:
-
-```c
-void send_output_command(uint8_t node_id, uint8_t mask)
-{
-    uint8_t data[8] = {0};
-    data[0] = mask & 0x3F;
-    data[1] = 0x00;
-    can_send_std(0x500 + node_id, data, 8);
-}
-
-void send_clear_fault(uint8_t node_id)
-{
-    uint8_t data[8] = {0};
-    data[0] = 0x00;
-    data[1] = 0x01;
-    can_send_std(0x500 + node_id, data, 8);
-}
-```
-
-## 9. Lưu ý quan trọng
-
-- CAN_H/CAN_L không nối trực tiếp vào PA11/PA12.
-- PA11/PA12 là CAN_RX/CAN_TX giữa MCU và CAN transceiver.
-- Controller giao tiếp với board qua CAN_H/CAN_L ở connector.
-- Firmware hiện cấu hình CAN 500 kbps.
-- Feedback đang cấu hình active low trong firmware.
-- Không cấp trực tiếp +24V vào chân MCU feedback; phần cứng phải qua mạch input phù hợp.
-- Output active high.
-- Lost CAN timeout khác heartbeat.
-- Heartbeat là MCU gửi lên Controller, không refresh Lost CAN.
-- Lost CAN chỉ refresh bằng command frame hợp lệ từ Controller.
-- Nếu command dừng quá timeout, MCU sẽ all-off và set fail-safe active.
-- Trong fail-safe, ON command bị block.
-- Clear Fault chỉ hợp lệ khi command mask bằng 0.
-- Status frame hiện cần 2 byte feedback raw vì board có 12 feedback input.
-
-## 10. Phần còn lại và đề xuất phát triển tiếp
-
-Những phần chưa phải runtime chính hoặc có thể làm phase sau:
+Những phần có thể phát triển trong phase sau:
 
 - `fault.c/h` hiện chưa cần refactor lớn; có thể dùng làm helper/status summary sau.
 - Có thể mở rộng diagnostic thêm last fault code.
@@ -1038,9 +1025,10 @@ Những phần chưa phải runtime chính hoặc có thể làm phase sau:
 - Có thể thêm contactor cycle counter để bảo trì.
 - Có thể thêm uptime, reset reason.
 - Có thể thêm bootloader/update firmware qua CAN/UART nếu có yêu cầu riêng.
-- Có thể lưu log board test USB-CAN thành file để đưa vào hồ sơ nghiệm thu.
 
-## 11. Điểm khác biệt so với document/spec ban đầu
+---
+
+## 9. Điểm khác biệt so với document/spec ban đầu
 
 Document Word `MCU_IO_Module_Spec_Detailed R1.0.docx` là spec ban đầu. Firmware hiện tại có một số điểm đã cụ thể hóa hoặc khác với gợi ý ban đầu:
 
@@ -1074,7 +1062,9 @@ Data[4] = global status
 Data[5..7] = reserved
 ```
 
-## 12. Kết luận
+---
+
+## 10. Kết luận
 
 Firmware `DC_Combiner_MCU_IO_FW` hiện đã có đủ các module runtime chính cho MCU I/O board điều khiển DC Combiner Box 6 group:
 
@@ -1087,7 +1077,9 @@ Firmware `DC_Combiner_MCU_IO_FW` hiện đã có đủ các module runtime chín
 - Heartbeat/Diagnostic.
 - App runtime hook vào `main.c`.
 
-Các PC unit/integration tests hiện tại đều pass, firmware Debug build OK. Phần Controller có thể bắt đầu tích hợp theo CAN protocol trong báo cáo này, đặc biệt cần lưu ý:
+Các PC unit/integration tests hiện tại đều pass, firmware Debug build OK. Board test bằng USB-CAN-B đã xác nhận CAN protocol, NodeID, feedback mapping, Lost CAN và heartbeat hoạt động đúng.
+
+Phần Controller có thể bắt đầu tích hợp theo CAN protocol trong báo cáo này, đặc biệt cần lưu ý:
 
 - Gửi command định kỳ nếu muốn giữ ON.
 - Đọc status 2 byte feedback raw.
