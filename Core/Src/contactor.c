@@ -1,6 +1,7 @@
 #include "contactor.h"
 
 #include "config.h"
+#include "diagnostic.h"
 #include "feedback.h"
 
 #define CONTACTOR_STABLE_FAULT_DELAY_MS  CONFIG_CONTACTOR_STABLE_FAULT_DELAY_MS
@@ -43,11 +44,19 @@ static void Contactor_StartAbnormalIfNeeded(bsp_gpio_group_t group, uint32_t now
 
 static void Contactor_SetFault(bsp_gpio_group_t group, contactor_fault_t fault)
 {
+  bool was_fault = (contactor_groups[group].state == CONTACTOR_STATE_FAULT) ||
+                   (contactor_groups[group].fault != CONTACTOR_FAULT_NONE);
+
   BSP_GPIO_SetOutput(group, false);
   contactor_groups[group].command_on = false;
   contactor_groups[group].state = CONTACTOR_STATE_FAULT;
   contactor_groups[group].fault = fault;
   contactor_groups[group].abnormal_active = false;
+
+  if (!was_fault && (fault != CONTACTOR_FAULT_NONE))
+  {
+    Diagnostic_RecordGroupFault(group, (uint8_t)fault);
+  }
 }
 
 static void Contactor_HandleOnRequested(bsp_gpio_group_t group, uint32_t now_ms)
@@ -172,6 +181,9 @@ static void Contactor_HandleOff(bsp_gpio_group_t group, uint32_t now_ms)
 
 static void Contactor_HandleFault(bsp_gpio_group_t group)
 {
+  bool was_fault = (contactor_groups[group].state == CONTACTOR_STATE_FAULT) ||
+                   (contactor_groups[group].fault != CONTACTOR_FAULT_NONE);
+
   BSP_GPIO_SetOutput(group, false);
   contactor_groups[group].command_on = false;
   contactor_groups[group].state = CONTACTOR_STATE_FAULT;
@@ -180,6 +192,11 @@ static void Contactor_HandleFault(bsp_gpio_group_t group)
   if (contactor_groups[group].fault == CONTACTOR_FAULT_NONE)
   {
     contactor_groups[group].fault = CONTACTOR_FAULT_UNEXPECTED_OFF;
+
+    if (!was_fault)
+    {
+      Diagnostic_RecordGroupFault(group, (uint8_t)contactor_groups[group].fault);
+    }
   }
 }
 
@@ -450,6 +467,7 @@ bool Contactor_ClearFault(bsp_gpio_group_t group, uint32_t now_ms)
     contactor_groups[group].fault = CONTACTOR_FAULT_NONE;
     contactor_groups[group].state = CONTACTOR_STATE_OFF;
     contactor_groups[group].state_start_ms = now_ms;
+    Diagnostic_RecordFaultClear(group);
     return true;
   }
 
