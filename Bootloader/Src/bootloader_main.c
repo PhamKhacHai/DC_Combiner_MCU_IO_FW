@@ -1,5 +1,6 @@
 #include "stm32f1xx.h"
 
+#include "bootloader_can.h"
 #include "bootloader_request.h"
 
 #define APP_BASE_ADDR          (0x08004000U)
@@ -117,6 +118,16 @@ static void Bootloader_StayInSafeLoop(void)
 }
 
 __attribute__((noreturn))
+static void Bootloader_StayInCanLoop(int app_valid)
+{
+  while (1)
+  {
+    Bootloader_WriteOutputsReset();
+    BootloaderCan_Task(app_valid != 0);
+  }
+}
+
+__attribute__((noreturn))
 static void Bootloader_JumpToApplication(uint32_t app_sp, uint32_t app_reset)
 {
   app_entry_t app_entry = (app_entry_t)app_reset;
@@ -153,16 +164,29 @@ int main(void)
 {
   uint32_t app_sp = 0U;
   uint32_t app_reset = 0U;
+  int app_valid;
+  uint8_t node_id;
 
   Bootloader_ForceOutputsOff();
+  app_valid = Bootloader_IsValidApplication(&app_sp, &app_reset);
 
   if (BootloaderRequest_IsSet())
   {
     BootloaderRequest_Clear();
+
+    if (BootloaderCan_ConfigSystemClock())
+    {
+      node_id = BootloaderCan_ReadNodeId();
+      if (BootloaderCan_Init(node_id))
+      {
+        Bootloader_StayInCanLoop(app_valid);
+      }
+    }
+
     Bootloader_StayInSafeLoop();
   }
 
-  if (Bootloader_IsValidApplication(&app_sp, &app_reset))
+  if (app_valid)
   {
     Bootloader_JumpToApplication(app_sp, app_reset);
   }

@@ -63,10 +63,14 @@ add_subdirectory(cmake/stm32cubemx)
 
 add_executable(${BOOTLOADER_TARGET})
 target_sources(${BOOTLOADER_TARGET} PRIVATE
+    Bootloader/Src/bootloader_can.c
     Bootloader/Src/bootloader_main.c
     Core/Src/bootloader_request.c
     Core/Src/system_stm32f1xx.c
     startup_stm32f103xb.s
+)
+target_include_directories(${BOOTLOADER_TARGET} PRIVATE
+    Bootloader/Inc
 )
 target_link_libraries(${BOOTLOADER_TARGET} PRIVATE
     stm32cubemx
