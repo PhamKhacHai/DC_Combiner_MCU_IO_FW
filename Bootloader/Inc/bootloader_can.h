@@ -11,7 +11,7 @@ extern "C" {
 bool BootloaderCan_ConfigSystemClock(void);
 uint8_t BootloaderCan_ReadNodeId(void);
 bool BootloaderCan_Init(uint8_t node_id);
-void BootloaderCan_Task(bool app_valid);
+void BootloaderCan_Task(void);
 
 #ifdef __cplusplus
 }

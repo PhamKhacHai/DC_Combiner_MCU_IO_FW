@@ -6,28 +6,6 @@
 #define BL_FLASH_ERROR_FLAGS             (FLASH_SR_PGERR | FLASH_SR_WRPRTERR)
 #define BL_FLASH_CLEAR_FLAGS             (FLASH_SR_EOP | FLASH_SR_PGERR | FLASH_SR_WRPRTERR)
 
-#define BL_GPIO_PIN(pin)                 (1UL << (pin))
-#define BL_DO_GPIOA_MASK                 (BL_GPIO_PIN(8U) | BL_GPIO_PIN(10U))
-#define BL_DO_GPIOB_MASK                 (BL_GPIO_PIN(3U) | BL_GPIO_PIN(5U) | \
-                                          BL_GPIO_PIN(12U) | BL_GPIO_PIN(14U))
-
-static const uint16_t bootloader_flash_test_pattern[] = {
-    0xA55AU,
-    0x5AA5U,
-    0x1234U,
-    0xC3C3U,
-    0x0F0FU,
-    0xF0F0U,
-    0x55AAU,
-    0xAA55U,
-};
-
-static void BootloaderFlash_ForceOutputsOff(void)
-{
-  GPIOA->BRR = BL_DO_GPIOA_MASK;
-  GPIOB->BRR = BL_DO_GPIOB_MASK;
-}
-
 static void BootloaderFlash_ClearDetail(uint8_t detail[5])
 {
   for (uint8_t index = 0U; index < 5U; index++)
@@ -36,13 +14,51 @@ static void BootloaderFlash_ClearDetail(uint8_t detail[5])
   }
 }
 
-static void BootloaderFlash_SetStatusDetail(uint8_t detail[5])
+static bool BootloaderFlash_IsAddressRange(uint32_t address,
+                                           uint32_t length,
+                                           uint32_t start,
+                                           uint32_t end)
 {
-  uint32_t sr = FLASH->SR;
+  uint32_t end_address;
 
-  detail[0] = (uint8_t)(sr & 0xFFU);
-  detail[1] = (uint8_t)((sr >> 8U) & 0xFFU);
-  detail[2] = (uint8_t)(FLASH->CR & 0xFFU);
+  if (length == 0U)
+  {
+    return false;
+  }
+
+  if (address < start)
+  {
+    return false;
+  }
+
+  end_address = address + length - 1U;
+  if (end_address < address)
+  {
+    return false;
+  }
+
+  return end_address <= end;
+}
+
+bool BootloaderFlash_IsScratchAddressRange(uint32_t address, uint32_t length)
+{
+  return BootloaderFlash_IsMetadataAddressRange(address, length);
+}
+
+bool BootloaderFlash_IsAppAddressRange(uint32_t address, uint32_t length)
+{
+  return BootloaderFlash_IsAddressRange(address,
+                                        length,
+                                        BOOTLOADER_FLASH_APP_BASE_ADDR,
+                                        BOOTLOADER_FLASH_APP_END_ADDR);
+}
+
+bool BootloaderFlash_IsMetadataAddressRange(uint32_t address, uint32_t length)
+{
+  return BootloaderFlash_IsAddressRange(address,
+                                        length,
+                                        BOOTLOADER_FLASH_METADATA_PAGE_START,
+                                        BOOTLOADER_FLASH_METADATA_PAGE_END);
 }
 
 static void BootloaderFlash_ClearFlags(void)
@@ -59,12 +75,7 @@ static bool BootloaderFlash_WaitNotBusy(void)
     timeout--;
   }
 
-  if ((FLASH->SR & FLASH_SR_BSY) != 0U)
-  {
-    return false;
-  }
-
-  return true;
+  return (FLASH->SR & FLASH_SR_BSY) == 0U;
 }
 
 static bool BootloaderFlash_WaitReady(void)
@@ -102,33 +113,9 @@ static bool BootloaderFlash_Lock(void)
   return (FLASH->CR & FLASH_CR_LOCK) != 0U;
 }
 
-bool BootloaderFlash_IsScratchAddressRange(uint32_t address, uint32_t length)
+static bool BootloaderFlash_ErasePageUnlocked(uint32_t page_address)
 {
-  uint32_t end_address;
-
-  if (length == 0U)
-  {
-    return false;
-  }
-
-  if (address < BOOTLOADER_FLASH_SCRATCH_PAGE_START)
-  {
-    return false;
-  }
-
-  end_address = address + length - 1U;
-  if (end_address < address)
-  {
-    return false;
-  }
-
-  return end_address <= BOOTLOADER_FLASH_SCRATCH_PAGE_END;
-}
-
-bool BootloaderFlash_EraseScratchPage(void)
-{
-  if (!BootloaderFlash_IsScratchAddressRange(BOOTLOADER_FLASH_SCRATCH_PAGE_START,
-                                             BOOTLOADER_FLASH_PAGE_SIZE_BYTES))
+  if ((page_address % BOOTLOADER_FLASH_PAGE_SIZE_BYTES) != 0U)
   {
     return false;
   }
@@ -141,7 +128,7 @@ bool BootloaderFlash_EraseScratchPage(void)
   BootloaderFlash_ClearFlags();
 
   FLASH->CR |= FLASH_CR_PER;
-  FLASH->AR = BOOTLOADER_FLASH_SCRATCH_PAGE_START;
+  FLASH->AR = page_address;
   FLASH->CR |= FLASH_CR_STRT;
 
   if (!BootloaderFlash_WaitReady())
@@ -156,6 +143,173 @@ bool BootloaderFlash_EraseScratchPage(void)
   return true;
 }
 
+static bool BootloaderFlash_ProgramHalfWordUnlocked(uint32_t address, uint16_t value)
+{
+  if ((address & 1U) != 0U)
+  {
+    return false;
+  }
+
+  if (!BootloaderFlash_WaitNotBusy())
+  {
+    return false;
+  }
+
+  BootloaderFlash_ClearFlags();
+  FLASH->CR |= FLASH_CR_PG;
+  *(volatile uint16_t *)address = value;
+
+  if (!BootloaderFlash_WaitReady())
+  {
+    FLASH->CR &= ~FLASH_CR_PG;
+    return false;
+  }
+
+  FLASH->CR &= ~FLASH_CR_PG;
+  BootloaderFlash_ClearFlags();
+
+  return true;
+}
+
+static bool BootloaderFlash_ProgramBytesInRange(uint32_t address,
+                                                const uint8_t *data,
+                                                uint32_t length,
+                                                bool metadata_region)
+{
+  uint32_t padded_length;
+  uint32_t offset;
+  bool ok = false;
+
+  if ((data == 0) || (length == 0U) || ((address & 1U) != 0U))
+  {
+    return false;
+  }
+
+  padded_length = (length + 1U) & ~1U;
+  if (padded_length < length)
+  {
+    return false;
+  }
+
+  if (metadata_region)
+  {
+    if (!BootloaderFlash_IsMetadataAddressRange(address, padded_length))
+    {
+      return false;
+    }
+  }
+  else if (!BootloaderFlash_IsAppAddressRange(address, padded_length))
+  {
+    return false;
+  }
+
+  if (!BootloaderFlash_Unlock())
+  {
+    return false;
+  }
+
+  for (offset = 0U; offset < padded_length; offset += 2U)
+  {
+    uint16_t value = data[offset];
+
+    if ((offset + 1U) < length)
+    {
+      value |= (uint16_t)data[offset + 1U] << 8U;
+    }
+    else
+    {
+      value |= 0xFF00U;
+    }
+
+    if (!BootloaderFlash_ProgramHalfWordUnlocked(address + offset, value))
+    {
+      goto finish;
+    }
+  }
+
+  ok = true;
+
+finish:
+  return BootloaderFlash_Lock() && ok;
+}
+
+bool BootloaderFlash_EraseScratchPage(void)
+{
+  return false;
+}
+
+bool BootloaderFlash_EraseAppPages(uint32_t app_size, uint16_t *erased_pages)
+{
+  uint32_t page_count;
+  uint32_t page_index;
+  bool ok = false;
+
+  if ((app_size == 0U) || (app_size > BOOTLOADER_FLASH_APP_MAX_SIZE_BYTES))
+  {
+    return false;
+  }
+
+  page_count = (app_size + BOOTLOADER_FLASH_PAGE_SIZE_BYTES - 1U) /
+               BOOTLOADER_FLASH_PAGE_SIZE_BYTES;
+
+  if (!BootloaderFlash_IsAppAddressRange(BOOTLOADER_FLASH_APP_BASE_ADDR,
+                                         page_count * BOOTLOADER_FLASH_PAGE_SIZE_BYTES))
+  {
+    return false;
+  }
+
+  if (erased_pages != 0)
+  {
+    *erased_pages = 0U;
+  }
+
+  if (!BootloaderFlash_Unlock())
+  {
+    return false;
+  }
+
+  for (page_index = 0U; page_index < page_count; page_index++)
+  {
+    uint32_t page_address = BOOTLOADER_FLASH_APP_BASE_ADDR +
+                            (page_index * BOOTLOADER_FLASH_PAGE_SIZE_BYTES);
+
+    if (!BootloaderFlash_ErasePageUnlocked(page_address))
+    {
+      goto finish;
+    }
+
+    if (erased_pages != 0)
+    {
+      *erased_pages = (uint16_t)(*erased_pages + 1U);
+    }
+  }
+
+  ok = true;
+
+finish:
+  return BootloaderFlash_Lock() && ok;
+}
+
+bool BootloaderFlash_EraseMetadataPage(void)
+{
+  bool ok = false;
+
+  if (!BootloaderFlash_IsMetadataAddressRange(BOOTLOADER_FLASH_METADATA_PAGE_START,
+                                              BOOTLOADER_FLASH_PAGE_SIZE_BYTES))
+  {
+    return false;
+  }
+
+  if (!BootloaderFlash_Unlock())
+  {
+    return false;
+  }
+
+  ok = BootloaderFlash_ErasePageUnlocked(BOOTLOADER_FLASH_METADATA_PAGE_START);
+
+  return BootloaderFlash_Lock() && ok;
+}
+
 bool BootloaderFlash_VerifyErased(uint32_t address, uint32_t length)
 {
   uint32_t offset;
@@ -165,7 +319,8 @@ bool BootloaderFlash_VerifyErased(uint32_t address, uint32_t length)
     return false;
   }
 
-  if (!BootloaderFlash_IsScratchAddressRange(address, length))
+  if (!BootloaderFlash_IsAppAddressRange(address, length) &&
+      !BootloaderFlash_IsMetadataAddressRange(address, length))
   {
     return false;
   }
@@ -181,201 +336,76 @@ bool BootloaderFlash_VerifyErased(uint32_t address, uint32_t length)
   return true;
 }
 
+bool BootloaderFlash_ProgramAppBytes(uint32_t address,
+                                     const uint8_t *data,
+                                     uint32_t length)
+{
+  return BootloaderFlash_ProgramBytesInRange(address, data, length, false);
+}
+
+bool BootloaderFlash_ProgramMetadataBytes(uint32_t address,
+                                          const uint8_t *data,
+                                          uint32_t length)
+{
+  return BootloaderFlash_ProgramBytesInRange(address, data, length, true);
+}
+
+bool BootloaderFlash_VerifyBytes(uint32_t address,
+                                 const uint8_t *data,
+                                 uint32_t length)
+{
+  uint32_t offset;
+
+  if ((data == 0) || (length == 0U))
+  {
+    return false;
+  }
+
+  if (!BootloaderFlash_IsAppAddressRange(address, length) &&
+      !BootloaderFlash_IsMetadataAddressRange(address, length))
+  {
+    return false;
+  }
+
+  for (offset = 0U; offset < length; offset++)
+  {
+    if (*(volatile const uint8_t *)(address + offset) != data[offset])
+    {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 bool BootloaderFlash_ProgramHalfWords(uint32_t address,
                                       const uint16_t *data,
                                       uint32_t halfword_count)
 {
-  uint32_t index;
-  uint32_t length;
-
-  if ((data == 0) || (halfword_count == 0U) || ((address & 1U) != 0U))
-  {
-    return false;
-  }
-
-  if (halfword_count > (0xFFFFFFFFU / 2U))
-  {
-    return false;
-  }
-
-  length = halfword_count * 2U;
-  if (!BootloaderFlash_IsScratchAddressRange(address, length))
-  {
-    return false;
-  }
-
-  for (index = 0U; index < halfword_count; index++)
-  {
-    if (!BootloaderFlash_WaitNotBusy())
-    {
-      return false;
-    }
-
-    BootloaderFlash_ClearFlags();
-    FLASH->CR |= FLASH_CR_PG;
-    *(volatile uint16_t *)(address + (index * 2U)) = data[index];
-
-    if (!BootloaderFlash_WaitReady())
-    {
-      FLASH->CR &= ~FLASH_CR_PG;
-      return false;
-    }
-
-    FLASH->CR &= ~FLASH_CR_PG;
-    BootloaderFlash_ClearFlags();
-  }
-
-  return true;
+  return BootloaderFlash_ProgramMetadataBytes(address,
+                                             (const uint8_t *)data,
+                                             halfword_count * 2U);
 }
 
 bool BootloaderFlash_VerifyHalfWords(uint32_t address,
                                      const uint16_t *data,
                                      uint32_t halfword_count)
 {
-  uint32_t index;
-  uint32_t length;
-
-  if ((data == 0) || (halfword_count == 0U) || ((address & 1U) != 0U))
-  {
-    return false;
-  }
-
-  if (halfword_count > (0xFFFFFFFFU / 2U))
-  {
-    return false;
-  }
-
-  length = halfword_count * 2U;
-  if (!BootloaderFlash_IsScratchAddressRange(address, length))
-  {
-    return false;
-  }
-
-  for (index = 0U; index < halfword_count; index++)
-  {
-    if (*(volatile const uint16_t *)(address + (index * 2U)) != data[index])
-    {
-      return false;
-    }
-  }
-
-  return true;
+  return BootloaderFlash_VerifyBytes(address,
+                                     (const uint8_t *)data,
+                                     halfword_count * 2U);
 }
 
 bool BootloaderFlash_RunSelfTest(uint8_t *status, uint8_t *stage, uint8_t detail[5])
 {
-  bool ok = false;
-  bool cleanup_needed = false;
-  uint8_t result_status = BOOTLOADER_FLASH_STATUS_OK;
-  uint8_t result_stage = BOOTLOADER_FLASH_STAGE_DONE;
-
   if ((status == 0) || (stage == 0) || (detail == 0))
   {
     return false;
   }
 
   BootloaderFlash_ClearDetail(detail);
-  BootloaderFlash_ForceOutputsOff();
+  *status = BOOTLOADER_FLASH_STATUS_ADDRESS_RANGE_ERROR;
+  *stage = BOOTLOADER_FLASH_STAGE_DONE;
 
-  if (!BootloaderFlash_IsScratchAddressRange(BOOTLOADER_FLASH_SCRATCH_PAGE_START,
-                                             BOOTLOADER_FLASH_PAGE_SIZE_BYTES))
-  {
-    result_status = BOOTLOADER_FLASH_STATUS_ADDRESS_RANGE_ERROR;
-    result_stage = BOOTLOADER_FLASH_STAGE_DONE;
-    goto finish_without_lock;
-  }
-
-  result_stage = BOOTLOADER_FLASH_STAGE_UNLOCK;
-  if (!BootloaderFlash_Unlock())
-  {
-    result_status = BOOTLOADER_FLASH_STATUS_UNLOCK_FAIL;
-    BootloaderFlash_SetStatusDetail(detail);
-    goto finish_without_lock;
-  }
-
-  result_stage = BOOTLOADER_FLASH_STAGE_ERASE;
-  if (!BootloaderFlash_EraseScratchPage())
-  {
-    result_status = BOOTLOADER_FLASH_STATUS_ERASE_FAIL;
-    BootloaderFlash_SetStatusDetail(detail);
-    goto finish_with_lock;
-  }
-
-  result_stage = BOOTLOADER_FLASH_STAGE_ERASE_VERIFY;
-  if (!BootloaderFlash_VerifyErased(BOOTLOADER_FLASH_SCRATCH_PAGE_START,
-                                    BOOTLOADER_FLASH_PAGE_SIZE_BYTES))
-  {
-    result_status = BOOTLOADER_FLASH_STATUS_ERASE_VERIFY_FAIL;
-    BootloaderFlash_SetStatusDetail(detail);
-    goto finish_with_lock;
-  }
-
-  result_stage = BOOTLOADER_FLASH_STAGE_PROGRAM;
-  cleanup_needed = true;
-  if (!BootloaderFlash_ProgramHalfWords(BOOTLOADER_FLASH_SCRATCH_PAGE_START,
-                                        bootloader_flash_test_pattern,
-                                        (uint32_t)(sizeof(bootloader_flash_test_pattern) /
-                                                   sizeof(bootloader_flash_test_pattern[0]))))
-  {
-    result_status = BOOTLOADER_FLASH_STATUS_PROGRAM_FAIL;
-    BootloaderFlash_SetStatusDetail(detail);
-    goto cleanup_with_lock;
-  }
-
-  result_stage = BOOTLOADER_FLASH_STAGE_PROGRAM_VERIFY;
-  if (!BootloaderFlash_VerifyHalfWords(BOOTLOADER_FLASH_SCRATCH_PAGE_START,
-                                       bootloader_flash_test_pattern,
-                                       (uint32_t)(sizeof(bootloader_flash_test_pattern) /
-                                                  sizeof(bootloader_flash_test_pattern[0]))))
-  {
-    result_status = BOOTLOADER_FLASH_STATUS_PROGRAM_VERIFY_FAIL;
-    BootloaderFlash_SetStatusDetail(detail);
-    goto cleanup_with_lock;
-  }
-
-  result_stage = BOOTLOADER_FLASH_STAGE_FINAL_ERASE;
-  cleanup_needed = false;
-  if (!BootloaderFlash_EraseScratchPage())
-  {
-    result_status = BOOTLOADER_FLASH_STATUS_ERASE_FAIL;
-    BootloaderFlash_SetStatusDetail(detail);
-    goto finish_with_lock;
-  }
-
-  if (!BootloaderFlash_VerifyErased(BOOTLOADER_FLASH_SCRATCH_PAGE_START,
-                                    BOOTLOADER_FLASH_PAGE_SIZE_BYTES))
-  {
-    result_status = BOOTLOADER_FLASH_STATUS_ERASE_VERIFY_FAIL;
-    BootloaderFlash_SetStatusDetail(detail);
-    goto finish_with_lock;
-  }
-
-  ok = true;
-
-cleanup_with_lock:
-  if (cleanup_needed)
-  {
-    (void)BootloaderFlash_EraseScratchPage();
-  }
-
-finish_with_lock:
-  if (!BootloaderFlash_Lock() && ok)
-  {
-    result_status = BOOTLOADER_FLASH_STATUS_LOCK_FAIL;
-    result_stage = BOOTLOADER_FLASH_STAGE_LOCK;
-    BootloaderFlash_SetStatusDetail(detail);
-    ok = false;
-  }
-
-finish_without_lock:
-  if (ok)
-  {
-    result_stage = BOOTLOADER_FLASH_STAGE_DONE;
-  }
-
-  *status = result_status;
-  *stage = result_stage;
-  BootloaderFlash_ForceOutputsOff();
-
-  return ok;
+  return false;
 }

@@ -2,6 +2,7 @@
 
 #include "bootloader_flash.h"
 #include "bootloader_request.h"
+#include "bootloader_update.h"
 #include "stm32f1xx.h"
 
 #define BL_CAN_VERSION_MAJOR          (1U)
@@ -28,6 +29,33 @@ static uint32_t bootloader_request_id;
 static uint32_t bootloader_response_id;
 
 extern uint32_t SystemCoreClock;
+
+static uint32_t BootloaderCan_ReadLe32(const uint8_t *data)
+{
+  return ((uint32_t)data[0]) |
+         ((uint32_t)data[1] << 8U) |
+         ((uint32_t)data[2] << 16U) |
+         ((uint32_t)data[3] << 24U);
+}
+
+static uint16_t BootloaderCan_ReadLe16(const uint8_t *data)
+{
+  return (uint16_t)(((uint16_t)data[0]) | ((uint16_t)data[1] << 8U));
+}
+
+static void BootloaderCan_WriteLe16(uint8_t *data, uint16_t value)
+{
+  data[0] = (uint8_t)(value & 0xFFU);
+  data[1] = (uint8_t)((value >> 8U) & 0xFFU);
+}
+
+static void BootloaderCan_WriteLe32(uint8_t *data, uint32_t value)
+{
+  data[0] = (uint8_t)(value & 0xFFU);
+  data[1] = (uint8_t)((value >> 8U) & 0xFFU);
+  data[2] = (uint8_t)((value >> 16U) & 0xFFU);
+  data[3] = (uint8_t)((value >> 24U) & 0xFFU);
+}
 
 static bool BootloaderCan_WaitSet(volatile uint32_t *reg, uint32_t mask, uint32_t timeout)
 {
@@ -303,8 +331,9 @@ static bool BootloaderCan_SendFrame(uint32_t std_id, const uint8_t data[8])
   return tx_ok;
 }
 
-static void BootloaderCan_SendBootInfo(uint8_t status, bool app_valid)
+static void BootloaderCan_SendBootInfo(uint8_t status)
 {
+  bool app_valid = BootloaderUpdate_IsApplicationValid(0, 0);
   uint8_t response[8] = {
       BOOTLOADER_RESPONSE_GET_BOOT_INFO,
       status,
@@ -353,6 +382,99 @@ static void BootloaderCan_SendFlashSelfTestResponse(uint8_t status,
   (void)BootloaderCan_SendFrame(bootloader_response_id, response);
 }
 
+static void BootloaderCan_SendStartUpdateResponse(uint8_t status,
+                                                  uint8_t stage,
+                                                  uint32_t app_size)
+{
+  uint8_t response[8] = {
+      BOOTLOADER_RESPONSE_START_UPDATE,
+      status,
+      stage,
+      0U,
+      0U,
+      0U,
+      0U,
+      0U,
+  };
+
+  BootloaderCan_WriteLe32(&response[3], app_size);
+  (void)BootloaderCan_SendFrame(bootloader_response_id, response);
+}
+
+static void BootloaderCan_SendEraseAppResponse(uint8_t status,
+                                               uint8_t stage,
+                                               uint16_t erased_pages)
+{
+  uint8_t response[8] = {
+      BOOTLOADER_RESPONSE_ERASE_APP,
+      status,
+      stage,
+      0U,
+      0U,
+      0U,
+      0U,
+      0U,
+  };
+
+  BootloaderCan_WriteLe16(&response[3], erased_pages);
+  (void)BootloaderCan_SendFrame(bootloader_response_id, response);
+}
+
+static void BootloaderCan_SendWriteChunkResponse(uint8_t status,
+                                                 uint16_t sequence,
+                                                 uint16_t next_sequence,
+                                                 uint8_t detail0,
+                                                 uint8_t detail1)
+{
+  uint8_t response[8] = {
+      BOOTLOADER_RESPONSE_WRITE_CHUNK,
+      status,
+      0U,
+      0U,
+      0U,
+      0U,
+      detail0,
+      detail1,
+  };
+
+  BootloaderCan_WriteLe16(&response[2], sequence);
+  BootloaderCan_WriteLe16(&response[4], next_sequence);
+  (void)BootloaderCan_SendFrame(bootloader_response_id, response);
+}
+
+static void BootloaderCan_SendVerifyCrcResponse(uint8_t status, uint32_t actual_crc)
+{
+  uint8_t response[8] = {
+      BOOTLOADER_RESPONSE_VERIFY_CRC,
+      status,
+      0U,
+      0U,
+      0U,
+      0U,
+      0U,
+      0U,
+  };
+
+  BootloaderCan_WriteLe32(&response[2], actual_crc);
+  (void)BootloaderCan_SendFrame(bootloader_response_id, response);
+}
+
+static void BootloaderCan_SendSimpleUpdateResponse(uint8_t response_type, uint8_t status)
+{
+  uint8_t response[8] = {
+      response_type,
+      status,
+      0U,
+      0U,
+      0U,
+      0U,
+      0U,
+      0U,
+  };
+
+  (void)BootloaderCan_SendFrame(bootloader_response_id, response);
+}
+
 static void BootloaderCan_SendError(uint8_t command, uint8_t status)
 {
   uint8_t response[8] = {
@@ -369,7 +491,118 @@ static void BootloaderCan_SendError(uint8_t command, uint8_t status)
   (void)BootloaderCan_SendFrame(bootloader_response_id, response);
 }
 
-void BootloaderCan_Task(bool app_valid)
+static void BootloaderCan_HandleStartUpdate(const uint8_t data[8])
+{
+  uint32_t app_size = BootloaderCan_ReadLe32(&data[3]);
+  uint8_t stage = (uint8_t)BootloaderUpdate_GetState();
+  uint8_t status;
+
+  if (!BootloaderRequest_HasUpdateMagic(BOOTLOADER_REQUEST_DLC, data))
+  {
+    BootloaderCan_SendStartUpdateResponse(BOOTLOADER_UPDATE_STATUS_BAD_MAGIC,
+                                          stage,
+                                          app_size);
+    return;
+  }
+
+  status = BootloaderUpdate_Start(app_size, data[7], &stage);
+  BootloaderCan_SendStartUpdateResponse(status, stage, app_size);
+}
+
+static void BootloaderCan_HandleEraseApp(const uint8_t data[8])
+{
+  uint8_t stage = (uint8_t)BootloaderUpdate_GetState();
+  uint16_t erased_pages = 0U;
+  uint8_t status;
+
+  if (!BootloaderRequest_HasUpdateMagic(BOOTLOADER_REQUEST_DLC, data))
+  {
+    BootloaderCan_SendEraseAppResponse(BOOTLOADER_UPDATE_STATUS_BAD_MAGIC,
+                                       stage,
+                                       erased_pages);
+    return;
+  }
+
+  status = BootloaderUpdate_EraseApp(&stage, &erased_pages);
+  BootloaderCan_SendEraseAppResponse(status, stage, erased_pages);
+}
+
+static void BootloaderCan_HandleWriteChunk(const uint8_t data[8])
+{
+  uint16_t sequence = BootloaderCan_ReadLe16(&data[1]);
+  uint16_t next_sequence = 0U;
+  uint8_t status;
+
+  status = BootloaderUpdate_WriteChunk(sequence, data[3], &data[4], &next_sequence);
+  BootloaderCan_SendWriteChunkResponse(status, sequence, next_sequence, 0U, 0U);
+}
+
+static void BootloaderCan_HandleVerifyCrc(const uint8_t data[8])
+{
+  uint32_t expected_crc = BootloaderCan_ReadLe32(&data[1]);
+  uint32_t actual_crc = 0U;
+  uint8_t status;
+
+  status = BootloaderUpdate_VerifyCrc(expected_crc, &actual_crc);
+  BootloaderCan_SendVerifyCrcResponse(status, actual_crc);
+}
+
+static void BootloaderCan_HandleFinishUpdate(const uint8_t data[8])
+{
+  uint8_t status;
+
+  if (!BootloaderRequest_HasUpdateMagic(BOOTLOADER_REQUEST_DLC, data))
+  {
+    BootloaderCan_SendSimpleUpdateResponse(BOOTLOADER_RESPONSE_FINISH_UPDATE,
+                                           BOOTLOADER_UPDATE_STATUS_BAD_MAGIC);
+    return;
+  }
+
+  status = BootloaderUpdate_Finish();
+  BootloaderCan_SendSimpleUpdateResponse(BOOTLOADER_RESPONSE_FINISH_UPDATE, status);
+}
+
+static void BootloaderCan_HandleAbortUpdate(const uint8_t data[8])
+{
+  uint8_t status;
+
+  if (!BootloaderRequest_HasUpdateMagic(BOOTLOADER_REQUEST_DLC, data))
+  {
+    BootloaderCan_SendSimpleUpdateResponse(BOOTLOADER_RESPONSE_ABORT_UPDATE,
+                                           BOOTLOADER_UPDATE_STATUS_BAD_MAGIC);
+    return;
+  }
+
+  status = BootloaderUpdate_Abort();
+  BootloaderCan_SendSimpleUpdateResponse(BOOTLOADER_RESPONSE_ABORT_UPDATE, status);
+}
+
+static void BootloaderCan_HandleResetToApp(const uint8_t data[8])
+{
+  uint8_t status = BOOTLOADER_UPDATE_STATUS_OK;
+
+  if (!BootloaderRequest_HasUpdateMagic(BOOTLOADER_REQUEST_DLC, data))
+  {
+    BootloaderCan_SendSimpleUpdateResponse(BOOTLOADER_RESPONSE_RESET_TO_APP,
+                                           BOOTLOADER_UPDATE_STATUS_BAD_MAGIC);
+    return;
+  }
+
+  if (!BootloaderUpdate_IsApplicationValid(0, 0))
+  {
+    status = BOOTLOADER_UPDATE_STATUS_APP_INVALID;
+  }
+
+  BootloaderCan_SendSimpleUpdateResponse(BOOTLOADER_RESPONSE_RESET_TO_APP, status);
+
+  if (status == BOOTLOADER_UPDATE_STATUS_OK)
+  {
+    __disable_irq();
+    NVIC_SystemReset();
+  }
+}
+
+void BootloaderCan_Task(void)
 {
   uint32_t std_id = 0U;
   uint8_t dlc = 0U;
@@ -391,12 +624,12 @@ void BootloaderCan_Task(bool app_valid)
   {
     if (command == BOOTLOADER_COMMAND_GET_BOOT_INFO)
     {
-      BootloaderCan_SendBootInfo(BOOTLOADER_RESPONSE_STATUS_BAD_DLC, app_valid);
+      BootloaderCan_SendBootInfo(BOOTLOADER_UPDATE_STATUS_BAD_DLC);
     }
     else if (command == BOOTLOADER_COMMAND_RUN_FLASH_SELF_TEST)
     {
       uint8_t detail[5] = {0};
-      BootloaderCan_SendFlashSelfTestResponse(BOOTLOADER_FLASH_STATUS_BAD_MAGIC,
+      BootloaderCan_SendFlashSelfTestResponse(BOOTLOADER_FLASH_STATUS_ADDRESS_RANGE_ERROR,
                                               BOOTLOADER_FLASH_STAGE_DONE,
                                               detail);
     }
@@ -409,7 +642,7 @@ void BootloaderCan_Task(bool app_valid)
 
   if (BootloaderRequest_IsGetBootInfoCommand(dlc, data))
   {
-    BootloaderCan_SendBootInfo(BOOTLOADER_RESPONSE_STATUS_OK, app_valid);
+    BootloaderCan_SendBootInfo(BOOTLOADER_UPDATE_STATUS_OK);
     return;
   }
 
@@ -421,20 +654,53 @@ void BootloaderCan_Task(bool app_valid)
 
   if (data[0] == BOOTLOADER_COMMAND_RUN_FLASH_SELF_TEST)
   {
-    uint8_t status = BOOTLOADER_FLASH_STATUS_OK;
-    uint8_t stage = BOOTLOADER_FLASH_STAGE_DONE;
     uint8_t detail[5] = {0};
+    (void)BootloaderRequest_IsRunFlashSelfTestCommand(dlc, data);
+    BootloaderCan_SendFlashSelfTestResponse(BOOTLOADER_FLASH_STATUS_ADDRESS_RANGE_ERROR,
+                                            BOOTLOADER_FLASH_STAGE_DONE,
+                                            detail);
+    return;
+  }
 
-    if (BootloaderRequest_IsRunFlashSelfTestCommand(dlc, data))
-    {
-      (void)BootloaderFlash_RunSelfTest(&status, &stage, detail);
-    }
-    else
-    {
-      status = BOOTLOADER_FLASH_STATUS_BAD_MAGIC;
-    }
+  if (command == BOOTLOADER_COMMAND_START_UPDATE)
+  {
+    BootloaderCan_HandleStartUpdate(data);
+    return;
+  }
 
-    BootloaderCan_SendFlashSelfTestResponse(status, stage, detail);
+  if (command == BOOTLOADER_COMMAND_ERASE_APP)
+  {
+    BootloaderCan_HandleEraseApp(data);
+    return;
+  }
+
+  if (command == BOOTLOADER_COMMAND_WRITE_CHUNK)
+  {
+    BootloaderCan_HandleWriteChunk(data);
+    return;
+  }
+
+  if (command == BOOTLOADER_COMMAND_VERIFY_CRC)
+  {
+    BootloaderCan_HandleVerifyCrc(data);
+    return;
+  }
+
+  if (command == BOOTLOADER_COMMAND_FINISH_UPDATE)
+  {
+    BootloaderCan_HandleFinishUpdate(data);
+    return;
+  }
+
+  if (command == BOOTLOADER_COMMAND_ABORT_UPDATE)
+  {
+    BootloaderCan_HandleAbortUpdate(data);
+    return;
+  }
+
+  if (command == BOOTLOADER_COMMAND_RESET_TO_APP)
+  {
+    BootloaderCan_HandleResetToApp(data);
     return;
   }
 

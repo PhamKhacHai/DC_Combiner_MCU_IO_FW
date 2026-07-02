@@ -1,12 +1,9 @@
 #include "stm32f1xx.h"
 
 #include "bootloader_can.h"
+#include "bootloader_flash.h"
 #include "bootloader_request.h"
-
-#define APP_BASE_ADDR          (0x08004000U)
-#define APP_FLASH_END_ADDR     (0x0800FBFFU)
-#define SRAM_START_ADDR        (0x20000000U)
-#define SRAM_END_ADDR          (0x20005000U)
+#include "bootloader_update.h"
 
 #define BL_GPIO_PIN(pin)       (1UL << (pin))
 
@@ -67,47 +64,6 @@ static void Bootloader_ForceOutputsOff(void)
   Bootloader_WriteOutputsReset();
 }
 
-static int Bootloader_IsValidApplication(uint32_t *app_sp, uint32_t *app_reset)
-{
-  uint32_t initial_sp = *(uint32_t *)APP_BASE_ADDR;
-  uint32_t reset_handler = *(uint32_t *)(APP_BASE_ADDR + 4U);
-  uint32_t reset_address = reset_handler & ~1UL;
-
-  if ((initial_sp == 0x00000000U) || (initial_sp == 0xFFFFFFFFU))
-  {
-    return 0;
-  }
-
-  if ((reset_handler == 0x00000000U) || (reset_handler == 0xFFFFFFFFU))
-  {
-    return 0;
-  }
-
-  if ((initial_sp < SRAM_START_ADDR) || (initial_sp > SRAM_END_ADDR))
-  {
-    return 0;
-  }
-
-  if ((initial_sp & 0x3U) != 0U)
-  {
-    return 0;
-  }
-
-  if ((reset_handler & 1U) == 0U)
-  {
-    return 0;
-  }
-
-  if ((reset_address < APP_BASE_ADDR) || (reset_address > APP_FLASH_END_ADDR))
-  {
-    return 0;
-  }
-
-  *app_sp = initial_sp;
-  *app_reset = reset_handler;
-  return 1;
-}
-
 __attribute__((noreturn))
 static void Bootloader_StayInSafeLoop(void)
 {
@@ -118,12 +74,12 @@ static void Bootloader_StayInSafeLoop(void)
 }
 
 __attribute__((noreturn))
-static void Bootloader_StayInCanLoop(int app_valid)
+static void Bootloader_StayInCanLoop(void)
 {
   while (1)
   {
     Bootloader_WriteOutputsReset();
-    BootloaderCan_Task(app_valid != 0);
+    BootloaderCan_Task();
   }
 }
 
@@ -146,7 +102,7 @@ static void Bootloader_JumpToApplication(uint32_t app_sp, uint32_t app_reset)
 
   Bootloader_WriteOutputsReset();
 
-  SCB->VTOR = APP_BASE_ADDR;
+  SCB->VTOR = BOOTLOADER_FLASH_APP_BASE_ADDR;
   __DSB();
   __ISB();
 
@@ -164,22 +120,28 @@ int main(void)
 {
   uint32_t app_sp = 0U;
   uint32_t app_reset = 0U;
-  int app_valid;
+  bool app_valid;
+  bool enter_bootloader_mode;
   uint8_t node_id;
 
   Bootloader_ForceOutputsOff();
-  app_valid = Bootloader_IsValidApplication(&app_sp, &app_reset);
+  BootloaderUpdate_Init();
+  app_valid = BootloaderUpdate_IsApplicationValid(&app_sp, &app_reset);
+  enter_bootloader_mode = BootloaderRequest_IsSet() || !app_valid;
 
   if (BootloaderRequest_IsSet())
   {
     BootloaderRequest_Clear();
+  }
 
+  if (enter_bootloader_mode)
+  {
     if (BootloaderCan_ConfigSystemClock())
     {
       node_id = BootloaderCan_ReadNodeId();
       if (BootloaderCan_Init(node_id))
       {
-        Bootloader_StayInCanLoop(app_valid);
+        Bootloader_StayInCanLoop();
       }
     }
 

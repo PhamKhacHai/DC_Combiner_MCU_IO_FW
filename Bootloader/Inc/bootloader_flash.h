@@ -16,9 +16,18 @@ extern "C" {
 #define BOOTLOADER_FLASH_BOOT_SIZE_KB           (16U)
 #define BOOTLOADER_FLASH_APP_SIZE_KB            (47U)
 
-#define BOOTLOADER_FLASH_SCRATCH_PAGE_START     (0x0800FC00U)
-#define BOOTLOADER_FLASH_SCRATCH_PAGE_END       (0x0800FFFFU)
-#define BOOTLOADER_FLASH_SCRATCH_PAGE_INDEX     (63U)
+#define BOOTLOADER_FLASH_APP_BASE_ADDR          (0x08004000U)
+#define BOOTLOADER_FLASH_APP_END_ADDR           (0x0800FBFFU)
+#define BOOTLOADER_FLASH_APP_MAX_SIZE_BYTES     \
+  (BOOTLOADER_FLASH_APP_SIZE_KB * 1024U)
+
+#define BOOTLOADER_FLASH_METADATA_PAGE_START    (0x0800FC00U)
+#define BOOTLOADER_FLASH_METADATA_PAGE_END      (0x0800FFFFU)
+#define BOOTLOADER_FLASH_METADATA_PAGE_INDEX    (63U)
+
+#define BOOTLOADER_FLASH_SCRATCH_PAGE_START     BOOTLOADER_FLASH_METADATA_PAGE_START
+#define BOOTLOADER_FLASH_SCRATCH_PAGE_END       BOOTLOADER_FLASH_METADATA_PAGE_END
+#define BOOTLOADER_FLASH_SCRATCH_PAGE_INDEX     BOOTLOADER_FLASH_METADATA_PAGE_INDEX
 
 #define BOOTLOADER_FLASH_STATUS_OK              (0x00U)
 #define BOOTLOADER_FLASH_STATUS_BAD_MAGIC       (0x01U)
@@ -40,8 +49,21 @@ extern "C" {
 #define BOOTLOADER_FLASH_STAGE_LOCK             (0x07U)
 
 bool BootloaderFlash_IsScratchAddressRange(uint32_t address, uint32_t length);
+bool BootloaderFlash_IsAppAddressRange(uint32_t address, uint32_t length);
+bool BootloaderFlash_IsMetadataAddressRange(uint32_t address, uint32_t length);
 bool BootloaderFlash_EraseScratchPage(void);
+bool BootloaderFlash_EraseAppPages(uint32_t app_size, uint16_t *erased_pages);
+bool BootloaderFlash_EraseMetadataPage(void);
 bool BootloaderFlash_VerifyErased(uint32_t address, uint32_t length);
+bool BootloaderFlash_ProgramAppBytes(uint32_t address,
+                                     const uint8_t *data,
+                                     uint32_t length);
+bool BootloaderFlash_ProgramMetadataBytes(uint32_t address,
+                                          const uint8_t *data,
+                                          uint32_t length);
+bool BootloaderFlash_VerifyBytes(uint32_t address,
+                                 const uint8_t *data,
+                                 uint32_t length);
 bool BootloaderFlash_ProgramHalfWords(uint32_t address,
                                       const uint16_t *data,
                                       uint32_t halfword_count);
