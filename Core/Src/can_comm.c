@@ -1,12 +1,14 @@
 #include "can_comm.h"
 
 #include "can.h"
+#include "bootloader_request.h"
 #include "config.h"
 #include "contactor.h"
 #include "diagnostic.h"
 #include "feedback.h"
 
 #define CAN_COMM_RX_STD_ID_MASK  (0x7CFU)
+#define CAN_COMM_RX_EXACT_ID_MASK (0x7FFU)
 
 static bsp_gpio_node_id_t can_node_id;
 static uint32_t can_command_id;
@@ -14,6 +16,7 @@ static uint32_t can_status_id;
 static uint32_t can_heartbeat_id;
 static uint32_t can_diag_request_id;
 static uint32_t can_diag_response_id;
+static uint32_t can_bootloader_request_id;
 
 static volatile bool command_pending;
 static volatile uint8_t pending_command_mask;
@@ -22,6 +25,10 @@ static volatile uint8_t pending_command_flags;
 static volatile bool diag_request_pending;
 static volatile uint8_t pending_diag_dlc;
 static volatile uint8_t pending_diag_data[8];
+
+static volatile bool bootloader_request_pending;
+static volatile uint8_t pending_bootloader_dlc;
+static volatile uint8_t pending_bootloader_data[8];
 
 static volatile bool has_received_command;
 static volatile uint32_t last_rx_ms;
@@ -49,6 +56,7 @@ static void CanComm_ResetState(uint32_t now_ms)
   can_heartbeat_id = Config_CanHeartbeatId(0U);
   can_diag_request_id = Config_CanDiagRequestId(0U);
   can_diag_response_id = Config_CanDiagResponseId(0U);
+  can_bootloader_request_id = BootloaderRequest_CanRequestId(0U);
 
   command_pending = false;
   pending_command_mask = 0U;
@@ -59,6 +67,13 @@ static void CanComm_ResetState(uint32_t now_ms)
   for (uint8_t index = 0U; index < 8U; index++)
   {
     pending_diag_data[index] = 0U;
+  }
+
+  bootloader_request_pending = false;
+  pending_bootloader_dlc = 0U;
+  for (uint8_t index = 0U; index < 8U; index++)
+  {
+    pending_bootloader_data[index] = 0U;
   }
 
   has_received_command = false;
@@ -76,22 +91,32 @@ static void CanComm_ResetState(uint32_t now_ms)
   tx_error_count = 0U;
 }
 
-static bool CanComm_ConfigFilter(void)
+static bool CanComm_ConfigIdMaskFilter(uint32_t filter_bank, uint32_t std_id, uint32_t std_id_mask)
 {
   CAN_FilterTypeDef filter = {0};
 
-  filter.FilterBank = 0U;
+  filter.FilterBank = filter_bank;
   filter.FilterMode = CAN_FILTERMODE_IDMASK;
   filter.FilterScale = CAN_FILTERSCALE_32BIT;
-  filter.FilterIdHigh = (uint16_t)((can_command_id & CAN_COMM_RX_STD_ID_MASK) << 5);
+  filter.FilterIdHigh = (uint16_t)((std_id & std_id_mask) << 5);
   filter.FilterIdLow = 0x0000U;
-  filter.FilterMaskIdHigh = (uint16_t)(CAN_COMM_RX_STD_ID_MASK << 5);
+  filter.FilterMaskIdHigh = (uint16_t)(std_id_mask << 5);
   filter.FilterMaskIdLow = 0x0000U;
   filter.FilterFIFOAssignment = CAN_RX_FIFO0;
   filter.FilterActivation = ENABLE;
   filter.SlaveStartFilterBank = 14U;
 
   return HAL_CAN_ConfigFilter(&hcan, &filter) == HAL_OK;
+}
+
+static bool CanComm_ConfigFilters(void)
+{
+  if (!CanComm_ConfigIdMaskFilter(0U, can_command_id, CAN_COMM_RX_STD_ID_MASK))
+  {
+    return false;
+  }
+
+  return CanComm_ConfigIdMaskFilter(1U, can_bootloader_request_id, CAN_COMM_RX_EXACT_ID_MASK);
 }
 
 static void CanComm_CopyPendingCommand(bool *has_command, uint8_t *command_mask, uint8_t *command_flags)
@@ -129,6 +154,30 @@ static void CanComm_CopyPendingDiagnosticRequest(bool *has_request,
 
   diag_request_pending = false;
   pending_diag_dlc = 0U;
+
+  __set_PRIMASK(primask);
+}
+
+static void CanComm_CopyPendingBootloaderRequest(bool *has_request,
+                                                 uint8_t *dlc,
+                                                 uint8_t data[8])
+{
+  uint8_t index;
+  uint32_t primask = __get_PRIMASK();
+
+  __disable_irq();
+
+  *has_request = bootloader_request_pending;
+  *dlc = pending_bootloader_dlc;
+
+  for (index = 0U; index < 8U; index++)
+  {
+    data[index] = pending_bootloader_data[index];
+    pending_bootloader_data[index] = 0U;
+  }
+
+  bootloader_request_pending = false;
+  pending_bootloader_dlc = 0U;
 
   __set_PRIMASK(primask);
 }
@@ -391,6 +440,35 @@ static void CanComm_HandleDiagnosticRequest(uint8_t dlc, const uint8_t data[8])
   (void)CanComm_SendDataFrame(can_diag_response_id, CONFIG_CAN_DIAG_RESPONSE_DLC, response);
 }
 
+static void CanComm_EnterBootloaderMode(uint32_t now_ms)
+{
+  Contactor_AllOff(now_ms);
+  BSP_GPIO_AllOutputsOff();
+
+  BootloaderRequest_Set();
+  if (!BootloaderRequest_IsSet())
+  {
+    return;
+  }
+
+  __disable_irq();
+  HAL_NVIC_SystemReset();
+
+  while (1)
+  {
+  }
+}
+
+static void CanComm_HandleBootloaderRequest(uint8_t dlc, const uint8_t data[8], uint32_t now_ms)
+{
+  if (!BootloaderRequest_IsEnterCommand(dlc, data))
+  {
+    return;
+  }
+
+  CanComm_EnterBootloaderMode(now_ms);
+}
+
 bool CanComm_Init(uint32_t now_ms)
 {
   CanComm_ResetState(now_ms);
@@ -401,8 +479,9 @@ bool CanComm_Init(uint32_t now_ms)
   can_heartbeat_id = Config_CanHeartbeatId(can_node_id);
   can_diag_request_id = Config_CanDiagRequestId(can_node_id);
   can_diag_response_id = Config_CanDiagResponseId(can_node_id);
+  can_bootloader_request_id = BootloaderRequest_CanRequestId(can_node_id);
 
-  if (!CanComm_ConfigFilter())
+  if (!CanComm_ConfigFilters())
   {
     tx_error_count++;
     return false;
@@ -432,10 +511,13 @@ void CanComm_Task(uint32_t now_ms)
 {
   bool has_command = false;
   bool has_diag_request = false;
+  bool has_bootloader_request = false;
   uint8_t command_mask = 0U;
   uint8_t command_flags = 0U;
   uint8_t diag_dlc = 0U;
   uint8_t diag_data[8] = {0};
+  uint8_t bootloader_dlc = 0U;
+  uint8_t bootloader_data[8] = {0};
 
   if (!can_started)
   {
@@ -444,6 +526,12 @@ void CanComm_Task(uint32_t now_ms)
 
   CanComm_CopyPendingCommand(&has_command, &command_mask, &command_flags);
   CanComm_CopyPendingDiagnosticRequest(&has_diag_request, &diag_dlc, diag_data);
+  CanComm_CopyPendingBootloaderRequest(&has_bootloader_request, &bootloader_dlc, bootloader_data);
+
+  if (has_bootloader_request)
+  {
+    CanComm_HandleBootloaderRequest(bootloader_dlc, bootloader_data, now_ms);
+  }
 
   if (has_command)
   {
@@ -600,5 +688,20 @@ void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *can_handle)
     }
 
     diag_request_pending = true;
+    return;
+  }
+
+  if (rx_header.StdId == can_bootloader_request_id)
+  {
+    uint8_t index;
+
+    pending_bootloader_dlc = (uint8_t)rx_header.DLC;
+
+    for (index = 0U; index < 8U; index++)
+    {
+      pending_bootloader_data[index] = data[index];
+    }
+
+    bootloader_request_pending = true;
   }
 }

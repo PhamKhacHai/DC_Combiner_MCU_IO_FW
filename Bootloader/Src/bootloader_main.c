@@ -1,5 +1,7 @@
 #include "stm32f1xx.h"
 
+#include "bootloader_request.h"
+
 #define APP_BASE_ADDR          (0x08004000U)
 #define APP_FLASH_END_ADDR     (0x0800FBFFU)
 #define SRAM_START_ADDR        (0x20000000U)
@@ -106,6 +108,15 @@ static int Bootloader_IsValidApplication(uint32_t *app_sp, uint32_t *app_reset)
 }
 
 __attribute__((noreturn))
+static void Bootloader_StayInSafeLoop(void)
+{
+  while (1)
+  {
+    Bootloader_WriteOutputsReset();
+  }
+}
+
+__attribute__((noreturn))
 static void Bootloader_JumpToApplication(uint32_t app_sp, uint32_t app_reset)
 {
   app_entry_t app_entry = (app_entry_t)app_reset;
@@ -145,13 +156,16 @@ int main(void)
 
   Bootloader_ForceOutputsOff();
 
+  if (BootloaderRequest_IsSet())
+  {
+    BootloaderRequest_Clear();
+    Bootloader_StayInSafeLoop();
+  }
+
   if (Bootloader_IsValidApplication(&app_sp, &app_reset))
   {
     Bootloader_JumpToApplication(app_sp, app_reset);
   }
 
-  while (1)
-  {
-    Bootloader_WriteOutputsReset();
-  }
+  Bootloader_StayInSafeLoop();
 }

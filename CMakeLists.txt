@@ -64,6 +64,7 @@ add_subdirectory(cmake/stm32cubemx)
 add_executable(${BOOTLOADER_TARGET})
 target_sources(${BOOTLOADER_TARGET} PRIVATE
     Bootloader/Src/bootloader_main.c
+    Core/Src/bootloader_request.c
     Core/Src/system_stm32f1xx.c
     startup_stm32f103xb.s
 )
@@ -85,6 +86,7 @@ target_sources(${APP_TARGET} PRIVATE
     Core/Src/contactor.c
     Core/Src/can_comm.c
     Core/Src/diagnostic.c
+    Core/Src/bootloader_request.c
 )
 
 # Add include paths
