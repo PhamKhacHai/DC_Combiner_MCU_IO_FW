@@ -38,6 +38,28 @@ bool BootloaderRequest_IsGetBootInfoCommand(uint8_t dlc, const uint8_t data[8])
   return data[0] == BOOTLOADER_COMMAND_GET_BOOT_INFO;
 }
 
+bool BootloaderRequest_IsGetFlashLayoutCommand(uint8_t dlc, const uint8_t data[8])
+{
+  if (dlc != BOOTLOADER_REQUEST_DLC)
+  {
+    return false;
+  }
+
+  return data[0] == BOOTLOADER_COMMAND_GET_FLASH_LAYOUT;
+}
+
+bool BootloaderRequest_IsRunFlashSelfTestCommand(uint8_t dlc, const uint8_t data[8])
+{
+  if (dlc != BOOTLOADER_REQUEST_DLC)
+  {
+    return false;
+  }
+
+  return (data[0] == BOOTLOADER_COMMAND_RUN_FLASH_SELF_TEST) &&
+         (data[1] == BOOTLOADER_ENTER_MAGIC0) &&
+         (data[2] == BOOTLOADER_ENTER_MAGIC1);
+}
+
 static void BootloaderRequest_EnableBackupAccess(void)
 {
   RCC->APB1ENR |= RCC_APB1ENR_PWREN | RCC_APB1ENR_BKPEN;

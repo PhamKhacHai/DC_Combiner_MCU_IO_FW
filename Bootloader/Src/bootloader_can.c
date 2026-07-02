@@ -1,5 +1,6 @@
 #include "bootloader_can.h"
 
+#include "bootloader_flash.h"
 #include "bootloader_request.h"
 #include "stm32f1xx.h"
 
@@ -318,6 +319,40 @@ static void BootloaderCan_SendBootInfo(uint8_t status, bool app_valid)
   (void)BootloaderCan_SendFrame(bootloader_response_id, response);
 }
 
+static void BootloaderCan_SendFlashLayout(void)
+{
+  uint8_t response[8] = {
+      BOOTLOADER_RESPONSE_GET_FLASH_LAYOUT,
+      BOOTLOADER_RESPONSE_STATUS_OK,
+      BOOTLOADER_FLASH_PAGE_SIZE_KB,
+      BOOTLOADER_FLASH_BOOT_SIZE_KB,
+      BOOTLOADER_FLASH_APP_SIZE_KB,
+      BOOTLOADER_FLASH_SCRATCH_PAGE_INDEX,
+      0U,
+      0U,
+  };
+
+  (void)BootloaderCan_SendFrame(bootloader_response_id, response);
+}
+
+static void BootloaderCan_SendFlashSelfTestResponse(uint8_t status,
+                                                    uint8_t stage,
+                                                    const uint8_t detail[5])
+{
+  uint8_t response[8] = {
+      BOOTLOADER_RESPONSE_FLASH_SELF_TEST,
+      status,
+      stage,
+      detail[0],
+      detail[1],
+      detail[2],
+      detail[3],
+      detail[4],
+  };
+
+  (void)BootloaderCan_SendFrame(bootloader_response_id, response);
+}
+
 static void BootloaderCan_SendError(uint8_t command, uint8_t status)
 {
   uint8_t response[8] = {
@@ -358,6 +393,13 @@ void BootloaderCan_Task(bool app_valid)
     {
       BootloaderCan_SendBootInfo(BOOTLOADER_RESPONSE_STATUS_BAD_DLC, app_valid);
     }
+    else if (command == BOOTLOADER_COMMAND_RUN_FLASH_SELF_TEST)
+    {
+      uint8_t detail[5] = {0};
+      BootloaderCan_SendFlashSelfTestResponse(BOOTLOADER_FLASH_STATUS_BAD_MAGIC,
+                                              BOOTLOADER_FLASH_STAGE_DONE,
+                                              detail);
+    }
     else
     {
       BootloaderCan_SendError(command, BOOTLOADER_RESPONSE_STATUS_BAD_DLC);
@@ -368,6 +410,31 @@ void BootloaderCan_Task(bool app_valid)
   if (BootloaderRequest_IsGetBootInfoCommand(dlc, data))
   {
     BootloaderCan_SendBootInfo(BOOTLOADER_RESPONSE_STATUS_OK, app_valid);
+    return;
+  }
+
+  if (BootloaderRequest_IsGetFlashLayoutCommand(dlc, data))
+  {
+    BootloaderCan_SendFlashLayout();
+    return;
+  }
+
+  if (data[0] == BOOTLOADER_COMMAND_RUN_FLASH_SELF_TEST)
+  {
+    uint8_t status = BOOTLOADER_FLASH_STATUS_OK;
+    uint8_t stage = BOOTLOADER_FLASH_STAGE_DONE;
+    uint8_t detail[5] = {0};
+
+    if (BootloaderRequest_IsRunFlashSelfTestCommand(dlc, data))
+    {
+      (void)BootloaderFlash_RunSelfTest(&status, &stage, detail);
+    }
+    else
+    {
+      status = BOOTLOADER_FLASH_STATUS_BAD_MAGIC;
+    }
+
+    BootloaderCan_SendFlashSelfTestResponse(status, stage, detail);
     return;
   }
 
